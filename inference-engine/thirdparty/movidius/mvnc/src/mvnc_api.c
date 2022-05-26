@@ -1346,10 +1346,10 @@ static ncStatus_t deviceGetDeviceMemory(struct _devicePrivate_t *d,
     return NC_OK;
 }
 
-static ncStatus_t deviceSetStdIO2XLink(struct _devicePrivate_t *d, uint32_t data)
+static ncStatus_t deviceEnableXLog(struct _devicePrivate_t *d, uint32_t data)
 {
     deviceCommand_t config;
-    config.type = DEVICE_SET_STDIO_REDIRECT_XLINK;
+    config.type = DEVICE_ENABLE_XLOG;
     config.arg = data;
     CHECK_MUTEX_SUCCESS_RC(pthread_mutex_lock(&d->dev_stream_m), NC_ERROR);
     if (XLinkWriteData(d->device_mon_stream_id, (const uint8_t *) &config,
@@ -1367,6 +1367,10 @@ static ncStatus_t deviceSetStdIO2XLink(struct _devicePrivate_t *d, uint32_t data
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
+
+#define ANSI_COLOR_BLUE "\x1b[34m"
+#define ANSI_COLOR_RESET "\x1b[0m"
+#define XLOG_STOP_PACKET "\xff\xff\xff\xff\xff\xff\xff\xff"
 
 static void fprintfsock( int s, const char* fmt, ... ) {
     char* buf = NULL;
@@ -1407,21 +1411,92 @@ static void fprintfsock( int s, const char* fmt, ... ) {
         free( buf );
 }
 
+uint32_t get_line_length(uint8_t *data, int32_t remaining_size)
+{
+    for (int32_t i = 0; i < remaining_size; i++)
+        if ((char)data[i] == '\n')
+            return (i + 1);
+    return 0;
+}
+
+uint64_t get_timestamp()
+{
+    struct timespec spec;
+    clock_gettime(CLOCK_REALTIME, &spec);
+    uint64_t timestamp = (spec.tv_sec % 1000) * 1000 + spec.tv_nsec / 1e6;
+    return timestamp;
+}
+
 static void* debugConsoleThreadReader(void* ctx) {
     struct _devicePrivate_t *d = (struct _devicePrivate_t *) ctx;
     streamId_t streamId = d->printf_over_xlink_stream_id;
     int connfd = d->printf_over_xlink_conn_fd;
     streamPacketDesc_t * packet;
     XLinkError_t xerr;
+    // String for reconstruction of the log lines received over multiple XLink packets
+    char incomplete_line[512];
+    const char *core_name = "[MYRIAD]";
 
     fprintfsock(connfd, "XLinkConsole receiving loop begins\n");
     fprintfsock(connfd, "=========================================\n");
-    while(1){
-        // use 0 as the timeout to prevent trigger false reset
-        xerr = XLinkReadDataWithTimeout(streamId, &packet, 0);
-        if(X_LINK_SUCCESS != xerr || packet == NULL)
+    while (1)
+    {
+        // Length of the line to be displayed,
+        // it will be sequentially updated for each line
+        uint32_t line_length;
+        // The current position of first character to be displayed from the packet
+        uint32_t current_start_index = 0;
+        // Remaining number of characters from the current packet,
+        int32_t remaining_size;
+
+        xerr = XLinkReadData(streamId, &packet);
+        if(xerr != X_LINK_SUCCESS)
             break;
-        fprintfsock(connfd, NULL, packet->data, packet->length);
+        // Check if stop packet was received
+        if(packet->length == strlen(XLOG_STOP_PACKET) && strncmp((const char*)packet->data, XLOG_STOP_PACKET, strlen(XLOG_STOP_PACKET)) == 0)
+        {
+            xerr = XLinkReleaseData(streamId);
+            if (xerr != X_LINK_SUCCESS)
+            {
+                mvLog(MVLOG_ERROR, "XLinkReleaseData error %d", xerr);
+            }
+            break;
+        }
+
+        while (1)
+        {
+            remaining_size = packet->length - current_start_index;
+            line_length = get_line_length(&packet->data[current_start_index], remaining_size);
+            // If line_length is 0 this mean that the last line from the current packet was not
+            // received completely, the rest of the line being received in the next packets
+
+            if (!line_length)
+            {
+                if(strlen(incomplete_line))
+                {
+                    strncat(incomplete_line, (char*)&packet->data[current_start_index], remaining_size);
+                }
+                else
+                {
+                    strncpy(incomplete_line, (char*)&packet->data[current_start_index], remaining_size);
+                    incomplete_line[remaining_size] = '\0';
+                }
+                break;
+            }
+
+            if (!strlen(incomplete_line))
+            {
+                fprintfsock(connfd,"%s%s [%lu]: %.*s%s", ANSI_COLOR_BLUE, core_name, get_timestamp(), line_length, &packet->data[current_start_index], ANSI_COLOR_RESET);
+            }
+            else
+            {
+                fprintfsock(connfd, "%s%s [%lu]: %s%.*s%s", ANSI_COLOR_BLUE, core_name, get_timestamp(), incomplete_line, line_length, &packet->data[current_start_index], ANSI_COLOR_RESET);
+                incomplete_line[0] = '\0';
+            }
+            current_start_index += line_length;
+            if (current_start_index >= packet->length)
+                break;
+        }
         XLinkReleaseData(streamId);
     }
     fprintfsock(connfd, "=========================================\n"
@@ -1433,7 +1508,11 @@ static void* debugConsoleThreadReader(void* ctx) {
 static void printfOverXLinkClose(struct _devicePrivate_t *d) {
     if(d->printf_over_xlink_stream_id != INVALID_STREAM_ID) {
         /* Tell device stop redirect STDIO to XLink Console */
-        deviceSetStdIO2XLink(d, 0);
+        deviceEnableXLog(d, 0);
+        int sc = pthread_join(d->printf_over_xlink_thr, NULL);
+        if (sc) {
+            mvLog(MVLOG_ERROR, "Waiting for thread failed");
+        }
         XLinkCloseStream(d->printf_over_xlink_stream_id);
         d->printf_over_xlink_stream_id = INVALID_STREAM_ID;
     }
@@ -1462,15 +1541,14 @@ static void printfOverXLinkOpen(struct _devicePrivate_t *d) {
 
     /* export XLINK_PRINTF=1 to enable this feature */
     cfg_use_xlink_printf = getenv("XLINK_PRINTF");
-    if(cfg_use_xlink_printf == NULL)
-        return;
-    if(strcmp(cfg_use_xlink_printf, "1") != 0)
-        return;
+    // if(cfg_use_xlink_printf == NULL)
+    //     return;
+    // if(strcmp(cfg_use_xlink_printf, "1") != 0)
+    //     return;
 
     /* Tell device redirect STDIO to XLink Console */
-    deviceSetStdIO2XLink(d, 1);
-
-    streamId = XLinkOpenStream(linkId, streamName, 10*1024);
+    deviceEnableXLog(d, 1);
+    streamId = XLinkOpenStream(linkId, streamName, 50*1024);
     if(streamId == INVALID_STREAM_ID) {
         fprintf(stderr,"ERROR in XLinkOpenStream: %s\n", streamName);
         return;
@@ -1677,7 +1755,6 @@ static ncStatus_t destroyDeviceHandle(struct ncDeviceHandle_t **deviceHandlePtr)
 ncStatus_t ncDeviceClose(struct ncDeviceHandle_t **deviceHandlePtr, WatchdogHndl_t* watchdogHndl) {
     int found = 0;
     XLinkError_t rc = X_LINK_SUCCESS;
-
     if (!deviceHandlePtr) {
         mvLog(MVLOG_ERROR, "Handle is NULL");
         return NC_INVALID_HANDLE;

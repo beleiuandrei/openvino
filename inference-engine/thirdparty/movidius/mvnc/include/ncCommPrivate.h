@@ -110,7 +110,7 @@ typedef enum {
     DEVICE_GET_USED_MEMORY          = 2,
     DEVICE_GET_DEVICE_ID            = 3,
     DEVICE_WATCHDOG_PING            = 4,
-    DEVICE_SET_STDIO_REDIRECT_XLINK = 5,
+    DEVICE_ENABLE_XLOG              = 5,
     DEVICE_SET_POWER_CONFIG         = 6,
     DEVICE_RESET_POWER_CONFIG       = 7,
     DEVICE_ENABLE_ASYNC_DMA         = 8,
