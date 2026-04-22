@@ -69,6 +69,7 @@
 #include "transformations/common_optimizations/reshape_sequence_fusion.hpp"
 #include "transformations/common_optimizations/ric_fusion.hpp"
 #include "transformations/common_optimizations/sdpa_fusion.hpp"
+#include "transformations/common_optimizations/select_with_fp16_min_to_fp32_min.hpp"
 #include "transformations/common_optimizations/select_with_one_value_condition.hpp"
 #include "transformations/common_optimizations/sequence_fusion.hpp"
 #include "transformations/common_optimizations/shared_ops_optimization.hpp"
@@ -214,6 +215,7 @@ bool ov::pass::MOCTransformations::run_on_model(const std::shared_ptr<ov::Model>
     ADD_MATCHER(eliminations, EliminateUnsqueezeGather)
     ADD_MATCHER(eliminations, NopElimination, m_use_shapes)
     ADD_MATCHER(eliminations, SelectWithOneValueCondition)
+    ADD_MATCHER(eliminations, SelectWithFP16MinToFP32Min)
     eliminations->set_name("ov::pass::CommonEliminations");
 
     manager.register_pass<ov::pass::ConstantFolding>();
