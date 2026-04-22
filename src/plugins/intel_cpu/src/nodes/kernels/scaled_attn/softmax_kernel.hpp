@@ -289,7 +289,7 @@ inline void scale_add2_reduce_max(float* a,
                     "CPU: sparse_mask should not be nullptr.");
     size_t i = 0;
 #if defined(HAVE_AVX512F)
-    auto v_max0 = _mm512_set1_ps(std::numeric_limits<float>::lowest());
+    auto v_max0 = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
     auto v_max1 = v_max0;
     auto v_max2 = v_max0;
     auto v_max3 = v_max0;
@@ -413,7 +413,7 @@ inline void scale_add2_reduce_max(float* a,
     v_max0 = _mm512_max_ps(v_max0, v_max2);
     max = _mm512_reduce_max_ps(v_max0);
 #elif defined(HAVE_AVX2)
-    auto v_max0 = _mm256_set1_ps(std::numeric_limits<float>::lowest());
+    auto v_max0 = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
     auto v_max1 = v_max0;
     auto v_max2 = v_max0;
     auto v_max3 = v_max0;
@@ -540,7 +540,7 @@ inline void scale_add2_reduce_max(float* a,
     hmax(v_max0);
     max = _mm256_cvtss_f32(v_max0);
 #elif defined(OPENVINO_ARCH_ARM64)
-    auto v_max = vdupq_n_f32(std::numeric_limits<float>::lowest());
+    auto v_max = vdupq_n_f32(-std::numeric_limits<float>::infinity());
     auto v_scale = vdupq_n_f32(scale);
     auto v_nfltmax = vdupq_n_f32(-FLT_MAX);
     auto v_alibi_slope = vdupq_n_f32(alibi_slope);
@@ -635,8 +635,9 @@ inline void scale_add2_reduce_max(ov::float16* a,
                                   ov::float16& max) {
     size_t i = 0;
     constexpr float16_t min_f16 = std::numeric_limits<float16_t>::lowest();
+    constexpr float16_t neg_inf_f16 = -std::numeric_limits<float16_t>::infinity();
 #    if defined(HAVE_SVE)
-    svfloat16_t v_max = svdup_n_f16(min_f16);
+    svfloat16_t v_max = svdup_n_f16(neg_inf_f16);
     svfloat16_t v_scale = svdup_n_f16(static_cast<float16_t>(scale));
     svfloat16_t v_a;
     svuint16_t v_zeroi16 = svdup_n_u16(0);
@@ -705,7 +706,7 @@ inline void scale_add2_reduce_max(ov::float16* a,
     }
     max = svmaxv_f16(svptrue_b16(), v_max);
 #    elif defined(HAVE_NEON_FP16)
-    float16x8_t v_max = vdupq_n_f16(min_f16);
+    float16x8_t v_max = vdupq_n_f16(neg_inf_f16);
     float16x8_t v_scale = vdupq_n_f16(static_cast<float16_t>(scale));
     float16x8_t v_a;
     uint16x8_t v_zeroi16 = vdupq_n_u16(0);
@@ -1188,7 +1189,7 @@ inline void attn_softmax_kernel<float>(float* a,
                                                   scale_add2_reduce_max<true, true, true, true>};
     int dispatch =
         (alibi ? 0b100 : 0) | (attn_mask ? 0b010 : 0) | (causal_mask ? 0b001 : 0) | (sparse_mask ? 0b1000 : 0);
-    float max = std::numeric_limits<float>::lowest();
+    float max = -std::numeric_limits<float>::infinity();
     if (attn_mask_prec == ov::element::f32) {
         funcs_fp32[dispatch](a,
                              scale,
@@ -1230,6 +1231,31 @@ inline void attn_softmax_kernel<float>(float* a,
     float sum = 0.0F;
     if (sink != nullptr) {
         max = max > (*sink) ? max : (*sink);
+    }
+    // All-(-inf) inputs: softmax is undefined in the strict sense;
+    // return a uniform distribution 1/len over the valid positions.
+    if (std::isinf(max) && max < 0.0F) {
+        const float val = (len > 0) ? (1.0f / static_cast<float>(len)) : 0.0f;
+        if (dst_precision == ov::element::f32) {
+            auto* dst = static_cast<float*>(a_dst);
+            for (size_t i = 0; i < len; i++)
+                dst[i] = val;
+            if (total_size > len)
+                memset(dst + len, 0, sizeof(float) * (total_size - len));
+        } else if (dst_precision == ov::element::bf16) {
+            auto* dst = static_cast<ov::bfloat16*>(a_dst);
+            for (size_t i = 0; i < len; i++)
+                dst[i] = ov::bfloat16(val);
+            if (total_size > len)
+                memset(dst + len, 0, sizeof(ov::bfloat16) * (total_size - len));
+        } else {
+            auto* dst = static_cast<ov::float16*>(a_dst);
+            for (size_t i = 0; i < len; i++)
+                dst[i] = ov::float16(val);
+            if (total_size > len)
+                memset(dst + len, 0, sizeof(ov::float16) * (total_size - len));
+        }
+        return;
     }
 #if defined(OPENVINO_ARCH_ARM64)
     if (std::isinf(max) && max > 0.0F) {
@@ -1342,7 +1368,7 @@ inline void attn_softmax_kernel<ov::float16>(ov::float16* a,
         return;
     }
 #    endif
-    ov::float16 max = std::numeric_limits<ov::float16>::lowest();
+    ov::float16 max = -std::numeric_limits<ov::float16>::infinity();
     if (attn_mask_prec == ov::element::f16) {
         funcs_fp16[dispatch](a,
                              scale,
@@ -1380,6 +1406,27 @@ inline void attn_softmax_kernel<ov::float16>(ov::float16* a,
     ov::float16 sum = 0.0F;
     if (sink != nullptr) {
         max = std::max(max, static_cast<const ov::float16>(*sink));
+    }
+    // All-(-inf) inputs: return a uniform distribution 1/len over the valid positions.
+    {
+        const float max_check = static_cast<float>(max);
+        if (std::isinf(max_check) && max_check < 0.0F) {
+            const float val = (len > 0) ? (1.0f / static_cast<float>(len)) : 0.0f;
+            if (dst_precision == ov::element::f32) {
+                auto* dst = static_cast<float*>(a_dst);
+                for (size_t i = 0; i < len; i++)
+                    dst[i] = val;
+                if (total_size > len)
+                    memset(dst + len, 0, sizeof(float) * (total_size - len));
+            } else {
+                auto* dst = static_cast<ov::float16*>(a_dst);
+                for (size_t i = 0; i < len; i++)
+                    dst[i] = ov::float16(val);
+                if (total_size > len)
+                    memset(dst + len, 0, sizeof(ov::float16) * (total_size - len));
+            }
+            return;
+        }
     }
 #    if defined(OPENVINO_ARCH_ARM64)
     const float max_f = static_cast<float>(max);

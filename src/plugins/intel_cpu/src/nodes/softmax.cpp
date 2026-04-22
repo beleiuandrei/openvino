@@ -7,6 +7,7 @@
 #include <memory_desc/cpu_memory_desc_utils.h>
 #include <oneapi/dnnl/dnnl_types.h>
 
+#include <cmath>
 #include <common/utils.hpp>
 #include <cstddef>
 #include <memory>
@@ -243,6 +244,38 @@ void SoftMax::prepareParams() {
 void SoftMax::execute(const dnnl::stream& strm) {
     if (execPtr) {
         execPtr->exec(primArgs, strm);
+
+        // Replace NaN rows caused by all-(-inf) inputs with uniform 1/axis_dim.
+        auto dstMem = getDstMemoryAtPort(0);
+        const auto& shape = dstMem->getShape();
+        const auto& dims = shape.getDims();
+        if (dstMem->getDesc().getPrecision() == ov::element::f32 && dims.size() >= 2) {
+            auto* dst = dstMem->getDataAs<float>();
+            const size_t axis_dim = dims[axis];
+            size_t outer = 1;
+            for (size_t i = 0; i < static_cast<size_t>(axis); i++)
+                outer *= dims[i];
+            size_t inner = 1;
+            for (size_t i = static_cast<size_t>(axis) + 1; i < dims.size(); i++)
+                inner *= dims[i];
+            const float uniform_val = (axis_dim > 0) ? (1.0f / static_cast<float>(axis_dim)) : 0.0f;
+            for (size_t o = 0; o < outer; o++) {
+                for (size_t n = 0; n < inner; n++) {
+                    bool has_nan = false;
+                    for (size_t a = 0; a < axis_dim; a++) {
+                        if (std::isnan(dst[o * axis_dim * inner + a * inner + n])) {
+                            has_nan = true;
+                            break;
+                        }
+                    }
+                    if (has_nan) {
+                        for (size_t a = 0; a < axis_dim; a++) {
+                            dst[o * axis_dim * inner + a * inner + n] = uniform_val;
+                        }
+                    }
+                }
+            }
+        }
     } else {
         CPU_NODE_THROW("doesn't have an initialized executor");
     }
