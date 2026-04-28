@@ -1974,6 +1974,40 @@ void nameIOTensors(std::shared_ptr<ov::Model> model) {
     }
 }
 
+/**
+ * @brief Clamps infinity values in a typed buffer to [std::numeric_limits<T>::lowest(), std::numeric_limits<T>::max()].
+ */
+template <typename T>
+void clampInfinityInBuffer(T* data, size_t count) {
+    const float minVal = static_cast<float>(std::numeric_limits<T>::lowest());
+    const float maxVal = static_cast<float>(std::numeric_limits<T>::max());
+    ov::parallel_for(count, [data, minVal, maxVal](int64_t idx) {
+        const float val = static_cast<float>(data[idx]);
+        if (std::isinf(val)) {
+            data[idx] = static_cast<T>(val > 0.0f ? maxVal : minVal);
+        }
+    });
+}
+
+/**
+ * @brief Replaces +/-inf values in an output tensor with the finite limits of its element type.
+ * @details Supports fp32, fp16 and bf16 tensors. Integer tensors are left unchanged.
+ */
+void handleInfinityValues(ov::Tensor& tensor) {
+    const auto precision = tensor.get_element_type();
+    const size_t count = tensor.get_size();
+    if (precision == ov::element::f32) {
+        clampInfinityInBuffer(tensor.data<float>(), count);
+    } else if (precision == ov::element::f16) {
+        clampInfinityInBuffer(tensor.data<ov::float16>(), count);
+    } else if (precision == ov::element::bf16) {
+        clampInfinityInBuffer(tensor.data<ov::bfloat16>(), count);
+    } else {
+        std::cout << "WARNING: --handle-infinity-values: tensor type " << precision.get_type_name()
+                  << " does not support infinity; skipping." << std::endl;
+    }
+}
+
 std::pair<TensorMap, ProfVec> runInfer(ov::InferRequest& inferRequest, ov::CompiledModel& compiledModel,
                                        const TensorMap& inputs, const std::vector<std::string>& dumpedInputsPaths) {
     for (const auto& [tensorName, tensor] : inputs) {
@@ -2693,6 +2727,18 @@ static int runSingleImageTest() {
 
             TensorMap& outputTensors = outInference.first;
 
+            // Clamp infinity values for specified output tensors
+            if (!FLAGS_handle_infinity_values.empty()) {
+                const auto tensorsToClamp = splitStringList(FLAGS_handle_infinity_values, ';');
+                for (auto& [tensorName, tensor] : outputTensors) {
+                    if (std::find(tensorsToClamp.begin(), tensorsToClamp.end(), tensorName) !=
+                        tensorsToClamp.end()) {
+                        std::cout << "Clamping infinity values for output tensor: " << tensorName << std::endl;
+                        handleInfinityValues(tensor);
+                    }
+                }
+            }
+
             printPerformanceCountsAndLatency(numberOfTestCase, outInference.second, endTime - startTime);
 
             if (FLAGS_run_test) {
@@ -2721,6 +2767,18 @@ static int runSingleImageTest() {
                         LayoutDescription::create(tensorName, outUserLayouts, outModelLayouts, shape));
 
                     ++outputInd;
+                }
+
+                // Clamp infinity values for specified reference tensors
+                if (!FLAGS_handle_infinity_values.empty()) {
+                    const auto tensorsToClamp = splitStringList(FLAGS_handle_infinity_values, ';');
+                    for (auto& [tensorName, tensor] : referenceTensors) {
+                        if (std::find(tensorsToClamp.begin(), tensorsToClamp.end(), tensorName) !=
+                            tensorsToClamp.end()) {
+                            std::cout << "Clamping infinity values for reference tensor: " << tensorName << std::endl;
+                            handleInfinityValues(tensor);
+                        }
+                    }
                 }
 
                 outputInd = 0;
