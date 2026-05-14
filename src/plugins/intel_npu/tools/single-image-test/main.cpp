@@ -18,6 +18,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -1527,7 +1528,43 @@ bool testRRMSE(const TensorMap& outputs, const TensorMap& references, const Layo
 // (using 'nrmse_loss_threshold' flag, with expected value in range [0.0 -> infinity))
 // e.g. '--mode nrmse --nrmse_loss_threshold 0.01'
 // e.g. '--mode nrmse --nrmse_loss_threshold "logits:0.03;pred_boxes:0.05"'
+// Optional per-output slicing (last N elements along a given axis):
+// e.g. '--mode nrmse --nrmse_slice_axis "output1:2;output2:1" --nrmse_slice_size "output1:50;output2:10"'
 //
+
+// Slice a tensor to its last N elements along the given axis.
+// Uses row-major (C-contiguous) memory layout assumed by ov::Tensor.
+ov::Tensor sliceLastNAlongAxis(const ov::Tensor& tensor, size_t axis, size_t N) {
+    const ov::Shape& shape = tensor.get_shape();
+    const size_t ndim = shape.size();
+
+    OPENVINO_ASSERT(axis < ndim, "nrmse_slice_axis ", axis, " is out of range for tensor with ", ndim, " dimensions");
+    const size_t dA = shape[axis];
+    OPENVINO_ASSERT(N <= dA, "nrmse_slice_size ", N, " exceeds dimension size ", dA, " along axis ", axis);
+
+    ov::Shape newShape = shape;
+    newShape[axis] = N;
+    ov::Tensor result(tensor.get_element_type(), newShape);
+
+    // B = number of "rows" before the slice axis; E = flat size after the slice axis
+    size_t B = 1;
+    for (size_t i = 0; i < axis; ++i) B *= shape[i];
+    size_t E = 1;
+    for (size_t i = axis + 1; i < ndim; ++i) E *= shape[i];
+
+    const size_t elemSize = tensor.get_element_type().size();
+    const uint8_t* src = static_cast<const uint8_t*>(tensor.data());
+    uint8_t* dst = static_cast<uint8_t*>(result.data());
+    const size_t offset = dA - N;  // first source index along the axis
+
+    for (size_t b = 0; b < B; ++b) {
+        const uint8_t* srcRow = src + (b * dA + offset) * E * elemSize;
+        uint8_t* dstRow = dst + b * N * E * elemSize;
+        std::memcpy(dstRow, srcRow, N * E * elemSize);
+    }
+
+    return result;
+}
 
 bool computeNRMSE(const ov::Tensor& output, const ov::Tensor& reference, double threshold) {
     if (output.get_shape() != reference.get_shape()) {
@@ -1745,6 +1782,10 @@ bool testNRMSE(const TensorMap& outputs, const TensorMap& references, const Layo
     // Parse per-layer thresholds
     auto thresholdMap = utils::parsePerLayerValues(FLAGS_nrmse_loss_threshold, metric_defaults::nrmse_loss_threshold);
 
+    // Parse optional per-output slice parameters
+    auto sliceAxisMap = utils::parsePerLayerInts(FLAGS_nrmse_slice_axis);
+    auto sliceSizeMap = utils::parsePerLayerInts(FLAGS_nrmse_slice_size);
+
     bool allPassed = true;
     for (auto& [tensorName, output] : outputs) {
         auto referencesIterator = references.find(tensorName);
@@ -1753,7 +1794,39 @@ bool testNRMSE(const TensorMap& outputs, const TensorMap& references, const Layo
 
         double layerThreshold = utils::getValueForLayer(thresholdMap, tensorName);
 
-        BlobTestMethod blobComparator = [applySoftMax, layerThreshold](ov::Tensor outputTensor, ov::Tensor referenceTensor) {
+        // For npuw_out_tensor_1, count zeros and derive N from the Gaussian sum N*(N+1)/2
+        if (tensorName == "npuw_out_tensor_1" || tensorName == "633") {
+            auto fp32Tensor = npu::utils::toFP32(output);
+            const float* data = fp32Tensor.data<const float>();
+            size_t total = fp32Tensor.get_size();
+            size_t zeroCount = 0;
+            for (size_t i = 0; i < total; ++i) {
+                if (data[i] == 0.0f) {
+                    ++zeroCount;
+                }
+            }
+            // zeroCount == N*(N+1)/2  =>  N = floor((-1 + sqrt(1 + 8*zeroCount)) / 2)
+            int64_t gaussN = static_cast<int64_t>((-1.0 + std::sqrt(1.0 + 8.0 * static_cast<double>(zeroCount))) / 2.0);
+            std::cout << tensorName << ": zero count = " << zeroCount
+                      << "  =>  N = " << gaussN << std::endl;
+        }
+
+        // Determine whether slicing is requested for this output
+        auto axisIt = sliceAxisMap.find(tensorName);
+        auto sizeIt = sliceSizeMap.find(tensorName);
+        bool doSlice = (axisIt != sliceAxisMap.end()) && (sizeIt != sliceSizeMap.end());
+
+        size_t sliceAxis = doSlice ? static_cast<size_t>(axisIt->second) : 0;
+        size_t sliceSize = doSlice ? static_cast<size_t>(sizeIt->second) : 0;
+
+        BlobTestMethod blobComparator = [applySoftMax, layerThreshold, doSlice, sliceAxis, sliceSize, &tensorName]
+                (ov::Tensor outputTensor, ov::Tensor referenceTensor) {
+            if (doSlice) {
+                std::cout << "Slicing output '" << tensorName << "': last " << sliceSize
+                          << " elements along axis " << sliceAxis << std::endl;
+                outputTensor   = sliceLastNAlongAxis(outputTensor,   sliceAxis, sliceSize);
+                referenceTensor = sliceLastNAlongAxis(referenceTensor, sliceAxis, sliceSize);
+            }
             if (applySoftMax) {
                 std::vector<float> actOutput;
                 std::vector<float> refOutput;

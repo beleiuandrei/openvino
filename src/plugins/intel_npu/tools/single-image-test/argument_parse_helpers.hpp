@@ -83,6 +83,8 @@ DECLARE_string(raw_tolerance);
 DECLARE_string(cosim_threshold);
 DECLARE_string(rrmse_loss_threshold);
 DECLARE_string(nrmse_loss_threshold);
+DECLARE_string(nrmse_slice_axis);
+DECLARE_string(nrmse_slice_size);
 DECLARE_string(l2norm_threshold);
 DECLARE_string(overlap_threshold);
 DECLARE_string(map_threshold);
@@ -110,8 +112,16 @@ namespace utils {
 void parseCommandLine(int argc, char* argv[]);
 
 using PerLayerValueMap = std::map<std::string, double>;
+using PerLayerIntMap = std::map<std::string, int64_t>;
 
 PerLayerValueMap parsePerLayerValues(const std::string& str, double defaultValue);
 double getValueForLayer(const PerLayerValueMap& valueMap, const std::string& layerName);
+
+/**
+ * @brief Parse a string of per-layer integer values (no wildcard fallback).
+ * @param str Input string in format "layer1:value1;layer2:value2"
+ * @return Map of layer name to integer value (only explicitly named layers)
+ */
+PerLayerIntMap parsePerLayerInts(const std::string& str);
 
 }  // namespace utils
