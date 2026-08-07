@@ -754,6 +754,8 @@ void Snapshot::earlyRegroup() {
                 HNDL(RMSNorm2);
                 HNDL(RMSNorm3);
                 HNDL(RMSNorm4);
+                HNDL(RMSNorm5);
+                HNDL(RMSNorm6);
                 HNDL(DQMatMulCWu4);
                 HNDL(DQMatMulGQu4);
                 HNDL(DQMatMulCWi4);

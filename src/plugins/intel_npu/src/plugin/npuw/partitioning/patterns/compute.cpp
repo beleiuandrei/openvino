@@ -527,6 +527,97 @@ RMSNorm4::RMSNorm4(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, 
     register_matcher(std::make_shared<opp::Matcher>(div, "TagRMSNorm4"), std::move(callback));
 }
 
+// Reciprocal expressed as Power(sqrt, -1) instead of Divide (Power->ReduceMean->...->Power shape).
+RMSNorm5::RMSNorm5(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
+    auto power = opp::wrap_type<ov::op::v1::Power>({opp::any_input(), opp::any_input()});
+    auto reduce = opp::wrap_type<ov::op::v1::ReduceMean>({power, opp::any_input()});
+    auto cadd = opp::wrap_type<ov::op::v1::Add>({reduce, opp::any_input()});
+    auto sqrt = opp::wrap_type<ov::op::v0::Sqrt>({cadd});
+    auto inv = opp::wrap_type<ov::op::v1::Power>({sqrt, opp::any_input()});
+    auto multiply1 = opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), inv});
+    auto multiply2 = opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), multiply1});
+
+    auto node_to_gptr = snapshot->getNodeToGroupMap();
+
+    // Note: Use [=] to make sure the above objects stay alive in the callback
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& node_to_output = m.get_pattern_value_map();
+
+        auto matched_power = node_to_output.at(power).get_node_shared_ptr();
+        auto matched_reduce = node_to_output.at(reduce).get_node_shared_ptr();
+        auto matched_cadd = node_to_output.at(cadd).get_node_shared_ptr();
+        auto matched_sqrt = node_to_output.at(sqrt).get_node_shared_ptr();
+        auto matched_inv = node_to_output.at(inv).get_node_shared_ptr();
+        auto matched_multiply1 = node_to_output.at(multiply1).get_node_shared_ptr();
+        auto matched_multiply2 = node_to_output.at(multiply2).get_node_shared_ptr();
+
+        // Only a reciprocal (exponent == -1) forms rms_norm; other Power exponents match unrelated chains.
+        auto exp_const = ov::as_type_ptr<ov::op::v0::Constant>(matched_inv->input_value(1).get_node_shared_ptr());
+        if (!exp_const) {
+            return false;
+        }
+        const auto exp_vals = exp_const->cast_vector<float>();
+        if (exp_vals.size() != 1 || exp_vals[0] != -1.f) {
+            return false;
+        }
+
+        node_to_gptr->at(matched_power)->isolate(isol_tag);
+        node_to_gptr->at(matched_reduce)->isolate(isol_tag);
+        node_to_gptr->at(matched_cadd)->isolate(isol_tag);
+        node_to_gptr->at(matched_sqrt)->isolate(isol_tag);
+        node_to_gptr->at(matched_inv)->isolate(isol_tag);
+        node_to_gptr->at(matched_multiply1)->isolate(isol_tag);
+        node_to_gptr->at(matched_multiply2)->isolate(isol_tag);
+
+        return false;  // root hasn't changed
+    };
+    register_matcher(std::make_shared<opp::Matcher>(multiply2, "TagRMSNorm5"), std::move(callback));
+}
+
+// Reciprocal-sqrt fused into a single Power(-0.5) with no Sqrt (Power->ReduceMean->Add->Power shape).
+RMSNorm6::RMSNorm6(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
+    auto power = opp::wrap_type<ov::op::v1::Power>({opp::any_input(), opp::any_input()});
+    auto reduce = opp::wrap_type<ov::op::v1::ReduceMean>({power, opp::any_input()});
+    auto cadd = opp::wrap_type<ov::op::v1::Add>({reduce, opp::any_input()});
+    auto inv = opp::wrap_type<ov::op::v1::Power>({cadd, opp::any_input()});
+    auto multiply1 = opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), inv});
+    auto multiply2 = opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), multiply1});
+
+    auto node_to_gptr = snapshot->getNodeToGroupMap();
+
+    // Note: Use [=] to make sure the above objects stay alive in the callback
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& node_to_output = m.get_pattern_value_map();
+
+        auto matched_power = node_to_output.at(power).get_node_shared_ptr();
+        auto matched_reduce = node_to_output.at(reduce).get_node_shared_ptr();
+        auto matched_cadd = node_to_output.at(cadd).get_node_shared_ptr();
+        auto matched_inv = node_to_output.at(inv).get_node_shared_ptr();
+        auto matched_multiply1 = node_to_output.at(multiply1).get_node_shared_ptr();
+        auto matched_multiply2 = node_to_output.at(multiply2).get_node_shared_ptr();
+
+        // Only a reciprocal-sqrt (exponent == -0.5) forms rms_norm without a Sqrt node.
+        auto exp_const = ov::as_type_ptr<ov::op::v0::Constant>(matched_inv->input_value(1).get_node_shared_ptr());
+        if (!exp_const) {
+            return false;
+        }
+        const auto exp_vals = exp_const->cast_vector<float>();
+        if (exp_vals.size() != 1 || exp_vals[0] != -0.5f) {
+            return false;
+        }
+
+        node_to_gptr->at(matched_power)->isolate(isol_tag);
+        node_to_gptr->at(matched_reduce)->isolate(isol_tag);
+        node_to_gptr->at(matched_cadd)->isolate(isol_tag);
+        node_to_gptr->at(matched_inv)->isolate(isol_tag);
+        node_to_gptr->at(matched_multiply1)->isolate(isol_tag);
+        node_to_gptr->at(matched_multiply2)->isolate(isol_tag);
+
+        return false;  // root hasn't changed
+    };
+    register_matcher(std::make_shared<opp::Matcher>(multiply2, "TagRMSNorm6"), std::move(callback));
+}
+
 // TODO: visualize
 VariadicSplit::VariadicSplit(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
     auto vsplit = opp::wrap_type<ov::op::v1::VariadicSplit>({opp::any_input(), opp::any_input(), opp::any_input()});
